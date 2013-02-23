@@ -1,6 +1,6 @@
 /* ehci-msm-hsic.c - HSUSB Host Controller Driver Implementation
  *
- * Copyright (c) 2011-2012, Code Aurora Forum. All rights reserved.
+ * Copyright (c) 2011-2013, The Linux Foundation. All rights reserved.
  *
  * Partly derived from ehci-fsl.c and ehci-hcd.c
  * Copyright (c) 2000-2004 by David Brownell
@@ -79,7 +79,7 @@ struct msm_hsic_hcd {
 	struct clk		*cal_clk;
 	struct regulator	*hsic_vddcx;
 	struct regulator	*hsic_gdsc;
-	bool			async_int;
+	atomic_t		async_int;
 	atomic_t                in_lpm;
 	struct wake_lock	wlock;
 	int			peripheral_status_irq;
@@ -784,9 +784,14 @@ static int msm_hsic_suspend(struct msm_hsic_hcd *mehci)
 	 * power mode (LPM). This interrupt is level triggered. So USB IRQ
 	 * line must be disabled till async interrupt enable bit is cleared
 	 * in USBCMD register. Assert STP (ULPI interface STOP signal) to
-	 * block data communication from PHY.
+	 * block data communication from PHY.  Enable asynchronous interrupt
+	 * only when wakeup gpio IRQ is not present.
 	 */
-	writel_relaxed(readl_relaxed(USB_USBCMD) | ASYNC_INTR_CTRL |
+	if (mehci->wakeup_irq)
+		writel_relaxed(readl_relaxed(USB_USBCMD) |
+				ULPI_STP_CTRL, USB_USBCMD);
+	else
+		writel_relaxed(readl_relaxed(USB_USBCMD) | ASYNC_INTR_CTRL |
 				ULPI_STP_CTRL, USB_USBCMD);
 
 	/*
@@ -843,6 +848,9 @@ static int msm_hsic_resume(struct msm_hsic_hcd *mehci)
 		dev_dbg(mehci->dev, "%s called in !in_lpm\n", __func__);
 		return 0;
 	}
+
+	/* Handles race with Async interrupt */
+	disable_irq(hcd->irq);
 
 	if (pdata && pdata->standalone_latency)
 		pm_qos_update_request(&mehci->pm_qos_req_dma,
@@ -910,8 +918,8 @@ skip_phy_resume:
 
 	atomic_set(&mehci->in_lpm, 0);
 
-	if (mehci->async_int) {
-		mehci->async_int = false;
+	if (atomic_read(&mehci->async_int)) {
+		atomic_set(&mehci->async_int, 0);
 		pm_runtime_put_noidle(mehci->dev);
 		enable_irq(hcd->irq);
 	}
@@ -921,7 +929,8 @@ skip_phy_resume:
 		pm_runtime_put_noidle(mehci->dev);
 	}
 
-	dev_dbg(mehci->dev, "HSIC-USB exited from low power mode\n");
+	enable_irq(hcd->irq);
+	dev_info(mehci->dev, "HSIC-USB exited from low power mode\n");
 
 	return 0;
 }
@@ -946,12 +955,19 @@ static irqreturn_t msm_hsic_irq(struct usb_hcd *hcd)
 	struct ehci_hcd *ehci = hcd_to_ehci(hcd);
 	struct msm_hsic_hcd *mehci = hcd_to_hsic(hcd);
 	u32			status;
+	int			ret;
 
 	if (atomic_read(&mehci->in_lpm)) {
-		disable_irq_nosync(hcd->irq);
 		dev_dbg(mehci->dev, "phy async intr\n");
-		mehci->async_int = true;
-		pm_runtime_get(mehci->dev);
+		dbg_log_event(NULL, "Async IRQ", 0);
+		ret = pm_runtime_get(mehci->dev);
+		if ((ret == 1) || (ret == -EINPROGRESS)) {
+			pm_runtime_put_noidle(mehci->dev);
+		} else {
+			disable_irq_nosync(hcd->irq);
+			atomic_set(&mehci->async_int, 1);
+		}
+
 		return IRQ_HANDLED;
 	}
 
@@ -1041,8 +1057,8 @@ static int ehci_hsic_bus_suspend(struct usb_hcd *hcd)
 }
 
 #define RESUME_RETRY_LIMIT		3
-#define RESUME_SIGNAL_TIME_MS		(21 * 999)
-#define RESUME_SIGNAL_TIME_SOF_MS	(23 * 999)
+#define RESUME_SIGNAL_TIME_USEC		(21 * 1000)
+#define RESUME_SIGNAL_TIME_SOF_USEC	(23 * 1000)
 static int msm_hsic_resume_thread(void *data)
 {
 	struct msm_hsic_hcd *mehci = data;
@@ -1123,14 +1139,15 @@ resume_again:
 	if (ehci->resume_sof_bug && resume_needed) {
 		if (!tight_resume) {
 			mehci->resume_again = 0;
-			ehci_writel(ehci, GPT_LD(RESUME_SIGNAL_TIME_MS),
+			ehci_writel(ehci, GPT_LD(RESUME_SIGNAL_TIME_USEC - 1),
 					&mehci->timer->gptimer0_ld);
 			ehci_writel(ehci, GPT_RESET | GPT_RUN,
 					&mehci->timer->gptimer0_ctrl);
 			ehci_writel(ehci, INTR_MASK | STS_GPTIMER0_INTERRUPT,
 					&ehci->regs->intr_enable);
 
-			ehci_writel(ehci, GPT_LD(RESUME_SIGNAL_TIME_SOF_MS),
+			ehci_writel(ehci, GPT_LD(
+					RESUME_SIGNAL_TIME_SOF_USEC - 1),
 					&mehci->timer->gptimer1_ld);
 			ehci_writel(ehci, GPT_RESET | GPT_RUN,
 				&mehci->timer->gptimer1_ctrl);
@@ -1225,6 +1242,7 @@ static int ehci_hsic_bus_resume(struct usb_hcd *hcd)
 	ehci->next_statechange = jiffies + msecs_to_jiffies(5);
 	hcd->state = HC_STATE_RUNNING;
 	ehci->rh_state = EHCI_RH_RUNNING;
+	ehci->command |= CMD_RUN;
 
 	/* Now we can safely re-enable irqs */
 	ehci_writel(ehci, INTR_MASK, &ehci->regs->intr_enable);
@@ -1650,6 +1668,8 @@ struct msm_hsic_host_platform_data *msm_hsic_dt_to_pdata(
 	of_property_read_u32(node, "hsic,data-pad-offset",
 					&pdata->data_pad_offset);
 
+	pdata->bus_scale_table = msm_bus_cl_get_pdata(pdev);
+
 	return pdata;
 }
 
@@ -1909,6 +1929,11 @@ static int __devexit ehci_hsic_msm_remove(struct platform_device *pdev)
 
 	ehci_hsic_msm_debugfs_cleanup();
 	device_init_wakeup(&pdev->dev, 0);
+
+	/* If the device was removed no need to call pm_runtime_disable */
+	if (pdev->dev.power.power_state.event != PM_EVENT_INVALID)
+		pm_runtime_disable(&pdev->dev);
+
 	pm_runtime_set_suspended(&pdev->dev);
 
 	destroy_workqueue(ehci_wq);
@@ -1953,7 +1978,7 @@ static int msm_hsic_pm_suspend_noirq(struct device *dev)
 	struct usb_hcd *hcd = dev_get_drvdata(dev);
 	struct msm_hsic_hcd *mehci = hcd_to_hsic(hcd);
 
-	if (mehci->async_int) {
+	if (atomic_read(&mehci->async_int)) {
 		dev_dbg(dev, "suspend_noirq: Aborting due to pending interrupt\n");
 		return -EBUSY;
 	}
@@ -1980,6 +2005,7 @@ static int msm_hsic_pm_resume(struct device *dev)
 	 * start I/O.
 	 */
 	if (!atomic_read(&mehci->pm_usage_cnt) &&
+			!atomic_read(&mehci->async_int) &&
 			pm_runtime_suspended(dev))
 		return 0;
 
